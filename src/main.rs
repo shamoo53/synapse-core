@@ -88,8 +88,15 @@ async fn main() -> anyhow::Result<()> {
     let idempotency_service = IdempotencyService::new(&config.redis_url)?;
     tracing::info!("Redis idempotency service initialized");
 
+    // Spawn background processor for pending transactions (does not block HTTP server)
+    let processor_pool = pool.clone();
+    let processor_horizon = horizon_client.clone();
+    tokio::spawn(async move {
+        services::run_processor(processor_pool, processor_horizon).await;
+    });
+
     // Build router with state
-    let app_state = AppState { 
+    let app_state = AppState {
         db: pool,
         horizon_client,
     };
