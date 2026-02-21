@@ -5,6 +5,7 @@ mod handlers;
 mod middleware;
 mod stellar;
 mod services;
+mod schemas;
 
 use axum::{Router, extract::State, routing::{get, post}, middleware as axum_middleware};
 use http::header::HeaderValue;
@@ -19,6 +20,7 @@ use stellar::HorizonClient;
 use middleware::idempotency::IdempotencyService;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+use services::{JobScheduler, TransactionProcessorJob};
 
 /// OpenAPI Schema for the Synapse Core API
 #[derive(OpenApi)]
@@ -102,6 +104,26 @@ async fn main() -> anyhow::Result<()> {
         None => CorsLayer::permissive(), // Allow any origin when not configured (dev default)
     };
 
+    // Initialize the job scheduler
+    let scheduler = JobScheduler::new();
+    
+    // Create and register the transaction processor job
+    let transaction_processor_job = TransactionProcessorJob::new(
+        pool.clone(),
+        horizon_client.clone(),
+    );
+    if let Err(e) = scheduler.register_job(Box::new(transaction_processor_job)).await {
+        tracing::error!("Failed to register transaction processor job: {}", e);
+        return Err(anyhow::anyhow!("Failed to register job: {}", e));
+    }
+    
+    // Start the scheduler
+    if let Err(e) = scheduler.start().await {
+        tracing::error!("Failed to start job scheduler: {}", e);
+        return Err(anyhow::anyhow!("Failed to start scheduler: {}", e));
+    }
+    tracing::info!("Job scheduler initialized and started");
+
     // Build router with state
     let app_state = AppState {
         db: pool,
@@ -132,9 +154,44 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("listening on {}", addr);
     tracing::info!("Swagger UI available at http://localhost:{}/swagger-ui/", config.server_port);
 
+    // Handle graceful shutdown
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Shutdown the scheduler when the application exits
+    if let Err(e) = scheduler.stop().await {
+        tracing::error!("Failed to stop job scheduler: {}", e);
+    }
 
     Ok(())
+}
+
+// Graceful shutdown signal handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Received shutdown signal, starting graceful shutdown");
 }
 
